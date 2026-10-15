@@ -3,6 +3,7 @@
 //
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <intel_gpu/primitives/data.hpp>
 #include <intel_gpu/primitives/input_layout.hpp>
@@ -185,20 +186,28 @@ public:
                     gemms.push_back(id);
                 }
             }
+            // Kernel ids are fully_connected_int3_dpas_<variant>_<hash>: the digit keeps "dpas_simd8" from matching
+            // "dpas_simd8_t16_...".
+            auto is_variant = [](const std::string& id, const std::string& variant) {
+                const std::string prefix = "fully_connected_int3_dpas_" + variant + "_";
+                const auto pos = id.find(prefix);
+                return pos != std::string::npos && pos + prefix.size() < id.size() && std::isdigit(static_cast<unsigned char>(id[pos + prefix.size()]));
+            };
             if (impl->is_dynamic()) {
-                for (const std::string variant : {"scalar", "v1_t8", "v1_t16", "v1_t32_sg1"}) {
+                const std::vector<std::string> variants = is_dg2() ? std::vector<std::string>{"scalar", "dpas_simd8", "dpas_simd8_t16", "dpas_simd8_t32"}
+                                                                   : std::vector<std::string>{"scalar", "v1_t8", "v1_t16", "v1_t32_sg1"};
+                for (const auto& variant : variants) {
                     ASSERT_TRUE(std::any_of(gemms.begin(),
                                             gemms.end(),
                                             [&](const std::string& id) {
-                                                return id.find("fully_connected_int3_dpas_" + variant + "_") != std::string::npos;
+                                                return is_variant(id, variant);
                                             }))
                         << "missing " << variant;
                 }
             } else if (i < expected_gemms.size() && !expected_gemms[i].empty()) {
                 ASSERT_EQ(gemms.size(), expected_gemms[i].size()) << "rows = " << rows;
                 for (size_t k = 0; k < gemms.size(); ++k) {
-                    ASSERT_NE(gemms[k].find("fully_connected_int3_dpas_" + expected_gemms[i][k] + "_"), std::string::npos)
-                        << "rows = " << rows << ", kernel = " << gemms[k];
+                    ASSERT_TRUE(is_variant(gemms[k], expected_gemms[i][k])) << "rows = " << rows << ", kernel = " << gemms[k];
                 }
             }
 
@@ -231,6 +240,18 @@ public:
     static bool is_igpu() {
         return get_test_engine().get_device_info().dev_type == device_type::integrated_gpu;
     }
+
+    static bool is_dg2() {
+        return get_test_engine().get_device_info().arch == gpu_arch::xe_hpg;
+    }
+
+    // The variant a static FC with this many rows runs on DG2, or `other` elsewhere.
+    static std::string dg2_or(long rows, const char* other) {
+        if (!is_dg2()) {
+            return other;
+        }
+        return rows <= 8 ? "dpas_simd8" : rows <= 16 ? "dpas_simd8_t16" : "dpas_simd8_t32";
+    }
 };
 
 const Int3FcParams base{0, 0, 1024, 1024, 128, ZpKind::Scalar, false, false};
@@ -248,15 +269,15 @@ TEST_F(fully_connected_int3_gpu_tests, scalar_gemm_single_row) {
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v1_t8_few_rows) {
-    run(base, false, false, {2}, {{"v1_t8"}});
+    run(base, false, false, {2}, {{dg2_or(2, "v1_t8")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v1_t8) {
-    run(base, false, false, {8}, {{"v1_t8"}});
+    run(base, false, false, {8}, {{dg2_or(8, "v1_t8")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v1_t16) {
-    run(base, false, false, {16}, {{"v1_t16"}});
+    run(base, false, false, {16}, {{dg2_or(16, "v1_t16")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v1_t32) {
@@ -266,7 +287,7 @@ TEST_F(fully_connected_int3_gpu_tests, v1_t32) {
 TEST_F(fully_connected_int3_gpu_tests, v1_grouped_zp) {
     auto p = base;
     p.zp = ZpKind::Grouped;
-    run(p, false, false, {128}, {{"v1_t32_sg4"}});
+    run(p, false, false, {128}, {{dg2_or(128, "v1_t32_sg4")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, dynamic_no_zp) {
@@ -276,13 +297,13 @@ TEST_F(fully_connected_int3_gpu_tests, dynamic_no_zp) {
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v2_sg8) {
-    run(base, false, false, {128}, {{has_v2() ? "v2_sg8" : "v1_t32_sg4"}});
+    run(base, false, false, {128}, {{dg2_or(128, has_v2() ? "v2_sg8" : "v1_t32_sg4")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, v2_sg16) {
     auto p = base;
     p.ofm = 2048;
-    run(p, false, false, {256}, {{has_v2() ? "v2_sg16" : "v1_t32_sg4"}});
+    run(p, false, false, {256}, {{dg2_or(256, has_v2() ? "v2_sg16" : "v1_t32_sg4")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, dynamic_scale_group_64) {
@@ -302,7 +323,7 @@ TEST_F(fully_connected_int3_gpu_tests, transposed_scale_zp) {
 TEST_F(fully_connected_int3_gpu_tests, transposed_scale_v2) {
     auto p = base;
     p.transposed_decompression = true;
-    run(p, false, false, {128}, {{has_v2() ? "v2_sg8" : "v1_t32_sg4"}});
+    run(p, false, false, {128}, {{dg2_or(128, has_v2() ? "v2_sg8" : "v1_t32_sg4")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, bias_and_eltwise) {
@@ -364,11 +385,28 @@ TEST_F(fully_connected_int3_gpu_tests, cached_static) {
 }
 
 TEST_F(fully_connected_int3_gpu_tests, cached_static_v2) {
-    run(base, false, true, {128}, {{has_v2() ? "v2_sg8" : "v1_t32_sg4"}});
+    run(base, false, true, {128}, {{dg2_or(128, has_v2() ? "v2_sg8" : "v1_t32_sg4")}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, cached_dynamic) {
     auto p = with(base, 1, 1);
     p.fused_eltwise = true;
     run(p, true, true, {1, 20, 3});
+}
+
+// DG2 (Xe-HPG) runs the SIMD8 DPAS variants; the tests above cover 2-256 rows on them.
+TEST_F(fully_connected_int3_gpu_tests, dg2_simd8_prefill_1024) {
+    if (!is_dg2()) {
+        GTEST_SKIP();
+    }
+    run(base, false, false, {1024}, {{"dpas_simd8_t32"}});
+}
+
+TEST_F(fully_connected_int3_gpu_tests, dg2_simd8_dynamic) {
+    if (!is_dg2()) {
+        GTEST_SKIP();
+    }
+    auto p = base;
+    p.zp = ZpKind::None;
+    run(p, true, false, {1, 8, 32, 128, 512});
 }
