@@ -422,11 +422,19 @@ protected:
     }
 };
 
+// GEMM variants, indexed like FullyConnectedInt3DpasImpl::gemms.
+enum class GemmVariant : uint8_t { scalar, v1_t8, v1_t16, v1_t32_sg1, v1_t32_sg2, v1_t32_sg4, v1_t32_sg8, v2_sg8, v2_sg16, scalar_t8, scalar_t16, dpas_simd8, dpas_simd8_t16, dpas_simd8_t32 };
+
+// The Xe-HPG (DG2) variants: SIMD8 DPAS, one subgroup per 16-column weight block.
+constexpr bool is_simd8(GemmVariant variant) {
+    return variant == GemmVariant::dpas_simd8 || variant == GemmVariant::dpas_simd8_t16 || variant == GemmVariant::dpas_simd8_t32;
+}
+
 // One GEMM variant. Its JIT depends on N, K, the group layout, the zero point kind and the fused ops, but not on the
 // row count, which arrives as a kernel argument.
 class Int3FcGemm : public Int3FcGeneratorBase {
 public:
-    Int3FcGemm(std::string_view suffix, GemmConfig cfg) : Int3FcGeneratorBase(suffix), m_cfg(cfg) {}
+    Int3FcGemm(std::string_view suffix, GemmConfig cfg, GemmVariant variant) : Int3FcGeneratorBase(suffix), m_cfg(cfg), m_variant(variant) {}
 
 protected:
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
@@ -434,6 +442,10 @@ protected:
         const auto& desc = *params.typed_desc<fully_connected>();
         const size_t scale_idx = get_scale_idx(desc);
         auto jit = Int3FcGeneratorBase::get_jit_constants(params);
+
+        // A JIT constant rather than a build option: the build options of a batched program are shared by all its
+        // kernels, so a per-variant -DSIMD would not reach every kernel it was meant for.
+        jit.make("SIMD", is_simd8(m_variant) ? 8 : 16);
 
         jit.make("IFM_SIZE", info.ifm);
         jit.make("TILE_IN_B_PITCH", info.ifm);
@@ -533,14 +545,16 @@ protected:
 
     [[nodiscard]] std::string get_build_options(const RuntimeParams& params) const override {
         auto options = KernelGenerator::get_build_options(params);
-        if (m_cfg.v2) {
+        // A SIMD8 subgroup holds both 8-column halves of a block: at 128 GRF even the 8-row variant spills
+        // (~900 bytes per thread on DG2), at 256 none of them does.
+        if (m_cfg.v2 || is_simd8(m_variant)) {
             options += " -cl-intel-256-GRF-per-thread";
         }
         return options;
     }
 
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
-        return DispatchDataFunc{[cfg = m_cfg](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+        return DispatchDataFunc{[cfg = m_cfg, variant = m_variant](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
             assert(!params.is_dynamic());
             const auto info = get_int3_fc_info(params, rt_params);
             const auto& input = params.get_input_layout(0);
@@ -549,14 +563,15 @@ protected:
             const size_t n_blocks = info.ofm / osv;
 
             auto& wgs = kd.params.workGroups;
+            const size_t simd_val = is_simd8(variant) ? 8 : 16;
             if (cfg.dpas) {
                 const size_t m_groups = ceil_div(dispatch_rows, cfg.tile_m * cfg.sg_m);
-                wgs.global = {(n_blocks / cfg.nb) * simd, m_groups * cfg.sg_m, 1};
-                wgs.local = {simd, cfg.sg_m, 1};
+                wgs.global = {(n_blocks / cfg.nb) * simd_val, m_groups * cfg.sg_m, 1};
+                wgs.local = {simd_val, cfg.sg_m, 1};
             } else {
                 const size_t sg_k = get_sg_k(info, cfg);
-                wgs.global = {n_blocks * simd, ceil_div(dispatch_rows, cfg.tile_m) * sg_k, 1};
-                wgs.local = {simd, sg_k, 1};
+                wgs.global = {n_blocks * simd_val, ceil_div(dispatch_rows, cfg.tile_m) * sg_k, 1};
+                wgs.local = {simd_val, sg_k, 1};
             }
 
             const size_t rows_per_batch = input.get_partial_shape().size() == 3 ? input.get_shape()[1] : rows;
@@ -572,20 +587,29 @@ protected:
 
 private:
     GemmConfig m_cfg;
+    GemmVariant m_variant;
 };
 
-// GEMM variants, indexed like FullyConnectedInt3DpasImpl::gemms.
-enum class GemmVariant : uint8_t { scalar, v1_t8, v1_t16, v1_t32_sg1, v1_t32_sg2, v1_t32_sg4, v1_t32_sg8, v2_sg8, v2_sg16, scalar_t8, scalar_t16 };
-
 // The DPAS variants use the SIMD16 forms of the matrix builtins, which IGC lowers only from Xe-HPC on. On Xe-HPG
-// (DG2) they compile without error to code that has no dpas at all, so those devices run the scalar variants.
+// (DG2) they compile without error to code that has no dpas at all, so DG2 runs the SIMD8 variants instead.
 bool supports_simd16_dpas(gpu_arch arch) {
     return arch >= gpu_arch::xe_hpc;
+}
+
+bool supports_simd8_dpas(gpu_arch arch) {
+    return arch == gpu_arch::xe_hpg;
 }
 
 GemmVariant get_gemm_variant(const Int3FcInfo& info, gpu_arch arch, size_t rows) {
     if (rows < dpas_min_rows) {
         return GemmVariant::scalar;
+    }
+    // The SIMD8 variants read the osv16 blocked weights only, and keep one subgroup per row tile (SG_M == 1).
+    if (supports_simd8_dpas(arch) && !use_plain_weights_experiment()) {
+        if (rows <= 8) {
+            return GemmVariant::dpas_simd8;
+        }
+        return rows <= 16 ? GemmVariant::dpas_simd8_t16 : GemmVariant::dpas_simd8_t32;
     }
     if (!supports_simd16_dpas(arch)) {
         return rows <= 8 ? GemmVariant::scalar_t8 : GemmVariant::scalar_t16;
@@ -621,17 +645,20 @@ public:
     // can use, so that they are all compiled with the model, and picks one per execution. Its single-row GEMV is
     // compiled for exactly one row, so a single-row static impl of a dynamic model can reuse it with the quantizer.
     Stage::Ptr quantize = make_stage<Int3FcQuantize>();
-    std::array<Stage::Ptr, 11> gemms = {make_stage<Int3FcGemm>("scalar", GemmConfig{}),
-                                       make_stage<Int3FcGemm>("v1_t8", get_v1_config(8, 1)),
-                                       make_stage<Int3FcGemm>("v1_t16", get_v1_config(16, 1)),
-                                       make_stage<Int3FcGemm>("v1_t32_sg1", get_v1_config(32, 1)),
-                                       make_stage<Int3FcGemm>("v1_t32_sg2", get_v1_config(32, 2)),
-                                       make_stage<Int3FcGemm>("v1_t32_sg4", get_v1_config(32, 4)),
-                                       make_stage<Int3FcGemm>("v1_t32_sg8", get_v1_config(32, 8)),
-                                       make_stage<Int3FcGemm>("v2_sg8", get_v2_config(8)),
-                                       make_stage<Int3FcGemm>("v2_sg16", get_v2_config(16)),
-                                       make_stage<Int3FcGemm>("scalar_t8", get_scalar_config(8)),
-                                       make_stage<Int3FcGemm>("scalar_t16", get_scalar_config(16))};
+    std::array<Stage::Ptr, 14> gemms = {make_stage<Int3FcGemm>("scalar", GemmConfig{}, GemmVariant::scalar),
+                                       make_stage<Int3FcGemm>("v1_t8", get_v1_config(8, 1), GemmVariant::v1_t8),
+                                       make_stage<Int3FcGemm>("v1_t16", get_v1_config(16, 1), GemmVariant::v1_t16),
+                                       make_stage<Int3FcGemm>("v1_t32_sg1", get_v1_config(32, 1), GemmVariant::v1_t32_sg1),
+                                       make_stage<Int3FcGemm>("v1_t32_sg2", get_v1_config(32, 2), GemmVariant::v1_t32_sg2),
+                                       make_stage<Int3FcGemm>("v1_t32_sg4", get_v1_config(32, 4), GemmVariant::v1_t32_sg4),
+                                       make_stage<Int3FcGemm>("v1_t32_sg8", get_v1_config(32, 8), GemmVariant::v1_t32_sg8),
+                                       make_stage<Int3FcGemm>("v2_sg8", get_v2_config(8), GemmVariant::v2_sg8),
+                                       make_stage<Int3FcGemm>("v2_sg16", get_v2_config(16), GemmVariant::v2_sg16),
+                                       make_stage<Int3FcGemm>("scalar_t8", get_scalar_config(8), GemmVariant::scalar_t8),
+                                       make_stage<Int3FcGemm>("scalar_t16", get_scalar_config(16), GemmVariant::scalar_t16),
+                                       make_stage<Int3FcGemm>("dpas_simd8", get_v1_config(8, 1), GemmVariant::dpas_simd8),
+                                       make_stage<Int3FcGemm>("dpas_simd8_t16", get_v1_config(16, 1), GemmVariant::dpas_simd8_t16),
+                                       make_stage<Int3FcGemm>("dpas_simd8_t32", get_v1_config(32, 1), GemmVariant::dpas_simd8_t32)};
 
     FullyConnectedInt3DpasImpl() : PrimitiveImplOCL(FullyConnectedInt3Dpas::get_type_info_static()) {}
     FullyConnectedInt3DpasImpl(const program_node& node, const RuntimeParams& params) : FullyConnectedInt3DpasImpl() {

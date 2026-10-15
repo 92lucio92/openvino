@@ -137,9 +137,13 @@ KERNEL(quantize_input)(
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 #endif
 
+// The DG2 (Xe-HPG) variants set SIMD to 8 through the JIT: DG2 has DPAS only in its SIMD8 form.
+#ifndef SIMD
 #define SIMD             16
+#endif
 #define K_CHUNK          32                        // u3 values per 12-byte granule, and the DPAS K step
-#define CHUNK_UINTS      (3 * SIMD)
+#define PLANE_STRIDE     16                        // osv16 weights: a granule is 3 planes of 16 columns
+#define CHUNK_UINTS      (3 * PLANE_STRIDE)
 #define GROUP_SIZE       QUANTIZE_GROUP_SIZE
 #define CHUNKS_PER_GROUP (GROUP_SIZE / K_CHUNK)
 #define CHUNKS_K         (IFM_SIZE / K_CHUNK)
@@ -147,6 +151,21 @@ KERNEL(quantize_input)(
 #define M_BLOCKS         (TILE_M / 8)
 #define A_UINTS_PER_ROW  (TILE_IN_B_PITCH / 4)
 #define A_UINTS_PER_CHUNK (K_CHUNK / 4)
+
+// One lane's share of a DPAS A row (32 int8 along K): 4 bytes at SIMD8, 2 at SIMD16.
+#if SIMD == 8
+#define A_LANE_T         uint
+#define A_ROWS_T         int8
+#define AS_A_LANE        as_int
+#define A_READ(p)        intel_sub_group_block_read(p)
+#define A_READ4(p)       intel_sub_group_block_read4(p)
+#else
+#define A_LANE_T         ushort
+#define A_ROWS_T         short8
+#define AS_A_LANE        as_short
+#define A_READ(p)        intel_sub_group_block_read_us(p)
+#define A_READ4(p)       intel_sub_group_block_read_us4(p)
+#endif
 
 // The three words of granule `chunk` (along K) of output channel nblk * 16 + lane.
 #if WEIGHTS_PLAIN
@@ -162,8 +181,8 @@ KERNEL(quantize_input)(
     do {                                                                                 \
         const __global uint* wp_ = (B) + ((nblk) * CHUNKS_K + (chunk)) * CHUNK_UINTS;    \
         w0 = intel_sub_group_block_read(wp_);                                            \
-        w1 = intel_sub_group_block_read(wp_ + SIMD);                                     \
-        w2 = intel_sub_group_block_read(wp_ + 2 * SIMD);                                 \
+        w1 = intel_sub_group_block_read(wp_ + PLANE_STRIDE);                             \
+        w2 = intel_sub_group_block_read(wp_ + 2 * PLANE_STRIDE);                         \
     } while (0)
 #endif
 
@@ -566,7 +585,13 @@ KERNEL(fc)(
     const uint lane = get_sub_group_local_id();
     const uint sg   = (uint)get_local_id(1);
     const uint nb   = (uint)get_group_id(0);
+#if SIMD == 8
+    // A SIMD8 subgroup owns a whole 16-column weight block: lane L computes columns n and n + 8, so one
+    // set of activations feeds two dpas.
+    const uint n    = nb * 16 + lane;
+#else
     const uint n    = nb * SIMD + lane;
+#endif
 
     const uint var_pitch  = TILE_IN_B_PITCH / QUANTIZE_GROUP_SIZE;
     const uint batch_size = BATCH_SIZE;
@@ -576,6 +601,11 @@ KERNEL(fc)(
     float out[TILE_M];
     unroll_for (uint t = 0; t < TILE_M; ++t)
         out[t] = 0.0f;
+#if SIMD == 8 && USE_DPAS
+    float out1[TILE_M];
+    unroll_for (uint t = 0; t < TILE_M; ++t)
+        out1[t] = 0.0f;
+#endif
 
 #if USE_DPAS
     const uint m0 = ((uint)get_group_id(1) * SG_M + sg) * TILE_M;
@@ -590,6 +620,9 @@ KERNEL(fc)(
         const uint buf = it & 1u;
         unroll_for (uint i = 0; i < CHUNKS_PER_SG; ++i) {
             const uint cc = sg * CHUNKS_PER_SG + i;
+#if SIMD == 8
+#error "SIMD8 DPAS supports SG_M == 1 only"
+#endif
             uint w0, w1, w2;
             LOAD_GRANULE(B, nb, g0 * CHUNKS_PER_GROUP + cc, w0, w1, w2);
             wshare[buf][cc][lane] = U3_TO_DPAS_B(w0, w1, w2);
@@ -601,9 +634,23 @@ KERNEL(fc)(
             const uint g = g0 + gi;
 
             int8 wb[CHUNKS_PER_GROUP];
+#if SIMD == 8
+            int8 wb1[CHUNKS_PER_GROUP];
+#endif
             unroll_for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
 #if SG_M > 1
                 wb[cc] = wshare[buf][gi * CHUNKS_PER_GROUP + cc][lane];
+#elif SIMD == 8
+                // Lanes read columns 0-7 of each plane at +0 and columns 8-15 at +8.
+                const __global uint* wp = B + (nb * CHUNKS_K + g * CHUNKS_PER_GROUP + cc) * CHUNK_UINTS;
+                const uint w0 = intel_sub_group_block_read(wp);
+                const uint w1 = intel_sub_group_block_read(wp + PLANE_STRIDE);
+                const uint w2 = intel_sub_group_block_read(wp + 2 * PLANE_STRIDE);
+                const uint x0 = intel_sub_group_block_read(wp + 8);
+                const uint x1 = intel_sub_group_block_read(wp + PLANE_STRIDE + 8);
+                const uint x2 = intel_sub_group_block_read(wp + 2 * PLANE_STRIDE + 8);
+                wb[cc] = U3_TO_DPAS_B(w0, w1, w2);
+                wb1[cc] = U3_TO_DPAS_B(x0, x1, x2);
 #else
                 uint w0, w1, w2;
                 LOAD_GRANULE(B, nb, g * CHUNKS_PER_GROUP + cc, w0, w1, w2);
@@ -615,30 +662,41 @@ KERNEL(fc)(
 #if DECOMPRESSION_ZP_TERM
             const float bzp = WEI_ZP(n, g * GROUP_SIZE);
 #endif
+#if SIMD == 8
+            const float bs1 = WEI_SCALE(n + 8, g * GROUP_SIZE);
+#if DECOMPRESSION_ZP_TERM
+            const float bzp1 = WEI_ZP(n + 8, g * GROUP_SIZE);
+#endif
+#endif
 
             unroll_for (uint mb = 0; mb < M_BLOCKS; ++mb) {
                 // Activations for 8 rows x the whole group, one send per row. Rows
                 // past the end of the batch are clamped rather than skipped so the
                 // block read never leaves the buffer; their results are dropped.
-                ushort av[8][CHUNKS_PER_GROUP];
+                A_LANE_T av[8][CHUNKS_PER_GROUP];
                 float as[8];
 #if DECOMPRESSION_ZP_TERM
                 float asum[8];
 #endif
+                // Load all 8 rows of activations first (back-to-back block reads)
                 unroll_for (uint t = 0; t < 8; ++t) {
                     const uint row = min(m0 + mb * 8 + t, batch_size - 1);
-                    const __global ushort* ap = (const __global ushort*)(
+                    const __global A_LANE_T* ap = (const __global A_LANE_T*)(
                         quantized_input + row * TILE_IN_B_PITCH + g * GROUP_SIZE);
 #if CHUNKS_PER_GROUP == 4
-                    const ushort4 q = intel_sub_group_block_read_us4(ap);
+                    const MAKE_VECTOR_TYPE(A_LANE_T, 4) q = A_READ4(ap);
                     av[t][0] = q.s0;
                     av[t][1] = q.s1;
                     av[t][2] = q.s2;
                     av[t][3] = q.s3;
 #else
                     unroll_for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc)
-                        av[t][cc] = intel_sub_group_block_read_us(ap + cc * SIMD);
+                        av[t][cc] = A_READ(ap + cc * SIMD);
 #endif
+                }
+                // Scales after all the block reads, so the sends of the 8 rows are issued back to back.
+                unroll_for (uint t = 0; t < 8; ++t) {
+                    const uint row = min(m0 + mb * 8 + t, batch_size - 1);
                     const uint qv = (row * var_pitch + g) * 2;
                     as[t] = quan_var[qv];
 #if DECOMPRESSION_ZP_TERM
@@ -648,11 +706,17 @@ KERNEL(fc)(
 
                 // The int32 accumulator is drained and rescaled at each group boundary.
                 int8 acc = (int8)(0);
+#if SIMD == 8
+                int8 acc1 = (int8)(0);
+#endif
                 unroll_for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
-                    short8 a;
+                    A_ROWS_T a;
                     unroll_for (uint t = 0; t < 8; ++t)
-                        a[t] = as_short(av[t][cc]);
+                        a[t] = AS_A_LANE(av[t][cc]);
                     acc = intel_sub_group_i8_i8_matrix_mad_k32(a, wb[cc], acc);
+#if SIMD == 8
+                    acc1 = intel_sub_group_i8_i8_matrix_mad_k32(a, wb1[cc], acc1);
+#endif
                 }
 
                 unroll_for (uint t = 0; t < 8; ++t) {
@@ -661,6 +725,13 @@ KERNEL(fc)(
                     part -= bzp * asum[t];
 #endif
                     out[mb * 8 + t] += part * as[t] * bs;
+#if SIMD == 8
+                    float part1 = (float)acc1[t];
+#if DECOMPRESSION_ZP_TERM
+                    part1 -= bzp1 * asum[t];
+#endif
+                    out1[mb * 8 + t] += part1 * as[t] * bs1;
+#endif
                 }
             }
         }
@@ -817,22 +888,35 @@ KERNEL(fc)(
     if (n >= TILE_OUT_F_NUM)
         return;
 
-    unroll_for (uint t = 0; t < TILE_M; ++t) {
-        const uint row = m0 + t;
-        if (row < batch_size) {
-            float res = out[t];
-#if BIAS_TERM
-            res += (float)biases[n];
-#endif
-            const uint out_row = row;
-            const uint output_offset = n * TILE_OUT_F_PITCH + out_row * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
-            const float activated = res;
-#if HAS_FUSED_OPS
-            FUSED_OPS;
-            output[output_offset] = FUSED_OPS_RESULT;
+    // A SIMD8 lane stores columns n and n + 8. FUSED_OPS addresses the output through `n`.
+#if SIMD == 8 && USE_DPAS
+    const uint n_lo = n;
+    unroll_for (uint h = 0; h < 2; ++h) {
+        const uint n = n_lo + h * 8;
 #else
-            output[output_offset] = TO_OUTPUT_TYPE(activated);
+    {
 #endif
+        unroll_for (uint t = 0; t < TILE_M; ++t) {
+            const uint row = m0 + t;
+            if (row < batch_size) {
+#if SIMD == 8 && USE_DPAS
+                float res = h ? out1[t] : out[t];
+#else
+                float res = out[t];
+#endif
+#if BIAS_TERM
+                res += (float)biases[n];
+#endif
+                const uint out_row = row;
+                const uint output_offset = n * TILE_OUT_F_PITCH + out_row * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
+                const float activated = res;
+#if HAS_FUSED_OPS
+                FUSED_OPS;
+                output[output_offset] = FUSED_OPS_RESULT;
+#else
+                output[output_offset] = TO_OUTPUT_TYPE(activated);
+#endif
+            }
         }
     }
 #endif  // DPAS_V2
@@ -840,7 +924,13 @@ KERNEL(fc)(
 
 #undef SIMD
 #undef K_CHUNK
+#undef PLANE_STRIDE
 #undef CHUNK_UINTS
+#undef A_LANE_T
+#undef A_ROWS_T
+#undef AS_A_LANE
+#undef A_READ
+#undef A_READ4
 #undef GROUP_SIZE
 #undef CHUNKS_PER_GROUP
 #undef CHUNKS_K
