@@ -611,6 +611,9 @@ KERNEL(fc)(
     const uint m0 = ((uint)get_group_id(1) * SG_M + sg) * TILE_M;
 #if SG_M > 1
     __local int8 wshare[2][CHUNKS_PER_ITER][SIMD];
+#if SIMD == 8
+    __local int8 wshare1[2][CHUNKS_PER_ITER][SIMD];
+#endif
 #endif
 
     for (uint it = 0; it < ITERS_K; ++it) {
@@ -621,11 +624,21 @@ KERNEL(fc)(
         unroll_for (uint i = 0; i < CHUNKS_PER_SG; ++i) {
             const uint cc = sg * CHUNKS_PER_SG + i;
 #if SIMD == 8
-#error "SIMD8 DPAS supports SG_M == 1 only"
-#endif
+            // Lanes read columns 0-7 of each plane at +0 and columns 8-15 at +8.
+            const __global uint* wp = B + (nb * CHUNKS_K + g0 * CHUNKS_PER_GROUP + cc) * CHUNK_UINTS;
+            const uint w0 = intel_sub_group_block_read(wp);
+            const uint w1 = intel_sub_group_block_read(wp + PLANE_STRIDE);
+            const uint w2 = intel_sub_group_block_read(wp + 2 * PLANE_STRIDE);
+            const uint x0 = intel_sub_group_block_read(wp + 8);
+            const uint x1 = intel_sub_group_block_read(wp + PLANE_STRIDE + 8);
+            const uint x2 = intel_sub_group_block_read(wp + 2 * PLANE_STRIDE + 8);
+            wshare[buf][cc][lane]  = U3_TO_DPAS_B(w0, w1, w2);
+            wshare1[buf][cc][lane] = U3_TO_DPAS_B(x0, x1, x2);
+#else
             uint w0, w1, w2;
             LOAD_GRANULE(B, nb, g0 * CHUNKS_PER_GROUP + cc, w0, w1, w2);
             wshare[buf][cc][lane] = U3_TO_DPAS_B(w0, w1, w2);
+#endif
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 #endif
@@ -640,6 +653,9 @@ KERNEL(fc)(
             unroll_for (uint cc = 0; cc < CHUNKS_PER_GROUP; ++cc) {
 #if SG_M > 1
                 wb[cc] = wshare[buf][gi * CHUNKS_PER_GROUP + cc][lane];
+#if SIMD == 8
+                wb1[cc] = wshare1[buf][gi * CHUNKS_PER_GROUP + cc][lane];
+#endif
 #elif SIMD == 8
                 // Lanes read columns 0-7 of each plane at +0 and columns 8-15 at +8.
                 const __global uint* wp = B + (nb * CHUNKS_K + g * CHUNKS_PER_GROUP + cc) * CHUNK_UINTS;
