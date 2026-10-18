@@ -904,37 +904,47 @@ KERNEL(fc)(
     if (n >= TILE_OUT_F_NUM)
         return;
 
-    // A SIMD8 lane stores columns n and n + 8. FUSED_OPS addresses the output through `n`.
+    // As in the v2 epilogue, every result of the tile is computed before any is stored and no row is behind a
+    // branch: a branch per row puts each fused-op load in its own block, waited on before the next one is issued,
+    // and a store may alias the fused-op inputs. Rows past the batch take the last row's fused-op inputs and are
+    // not stored. A SIMD8 lane holds columns n and n + 8; FUSED_OPS addresses the output through `n`.
 #if SIMD == 8 && USE_DPAS
-    const uint n_lo = n;
-    unroll_for (uint h = 0; h < 2; ++h) {
-        const uint n = n_lo + h * 8;
+#define EP_HALVES 2
 #else
-    {
+#define EP_HALVES 1
 #endif
+    const uint n_lo = n;
+    OUTPUT_TYPE result[EP_HALVES][TILE_M];
+    unroll_for (uint h = 0; h < EP_HALVES; ++h) {
+        const uint n = n_lo + h * 8;
         unroll_for (uint t = 0; t < TILE_M; ++t) {
-            const uint row = m0 + t;
-            if (row < batch_size) {
 #if SIMD == 8 && USE_DPAS
-                float res = h ? out1[t] : out[t];
+            float res = h ? out1[t] : out[t];
 #else
-                float res = out[t];
+            float res = out[t];
 #endif
 #if BIAS_TERM
-                res += (float)biases[n];
+            res += (float)biases[n];
 #endif
-                const uint out_row = row;
-                const uint output_offset = n * TILE_OUT_F_PITCH + out_row * TILE_OUT_B_PITCH + OUTPUT_OFFSET;
-                const float activated = res;
+            const uint out_row = min(m0 + t, batch_size - 1);
+            const float activated = res;
 #if HAS_FUSED_OPS
-                FUSED_OPS;
-                output[output_offset] = FUSED_OPS_RESULT;
+            FUSED_OPS;
+            result[h][t] = FUSED_OPS_RESULT;
 #else
-                output[output_offset] = TO_OUTPUT_TYPE(activated);
+            result[h][t] = TO_OUTPUT_TYPE(activated);
 #endif
-            }
         }
     }
+    unroll_for (uint h = 0; h < EP_HALVES; ++h) {
+        const uint n = n_lo + h * 8;
+        unroll_for (uint t = 0; t < TILE_M; ++t) {
+            const uint row = m0 + t;
+            if (row < batch_size)
+                output[n * TILE_OUT_F_PITCH + row * TILE_OUT_B_PITCH + OUTPUT_OFFSET] = result[h][t];
+        }
+    }
+#undef EP_HALVES
 #endif  // DPAS_V2
 }
 
