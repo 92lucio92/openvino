@@ -187,7 +187,7 @@ public:
                 }
             }
             // Kernel ids are fully_connected_int3_dpas_<variant>_<hash>: the digit keeps "dpas_simd8" from matching
-            // "dpas_simd8_t16_...".
+            // "dpas_simd8_t32_sg2_...".
             auto is_variant = [](const std::string& id, const std::string& variant) {
                 const std::string prefix = "fully_connected_int3_dpas_" + variant + "_";
                 const auto pos = id.find(prefix);
@@ -195,7 +195,7 @@ public:
             };
             if (impl->is_dynamic()) {
                 const std::vector<std::string> variants =
-                    is_dg2() ? std::vector<std::string>{"scalar", "dpas_simd8", "dpas_simd8_t16", "dpas_simd8_t32", "dpas_simd8_t32_sg2", "dpas_simd8_t32_sg4"}
+                    is_dg2() ? std::vector<std::string>{"scalar", "dpas_simd8", "scalar_t16", "dpas_simd8_t32_sg2", "dpas_simd8_t32_sg4"}
                              : std::vector<std::string>{"scalar", "v1_t8", "v1_t16", "v1_t32_sg1"};
                 for (const auto& variant : variants) {
                     ASSERT_TRUE(std::any_of(gemms.begin(),
@@ -251,19 +251,19 @@ public:
         if (!is_dg2()) {
             return other;
         }
-        if (rows <= 8) {
+        if (rows <= 16) {
             return "dpas_simd8";
         }
-        if (rows <= 16) {
-            return "dpas_simd8_t16";
+        if (rows <= 32) {
+            return "scalar_t16";
+        }
+        if (rows <= 40) {
+            return "dpas_simd8";
         }
         if (rows >= 96) {
             return "dpas_simd8_t32_sg4";
         }
-        if (rows >= 48) {
-            return "dpas_simd8_t32_sg2";
-        }
-        return "dpas_simd8_t32";
+        return "dpas_simd8_t32_sg2";
     }
 };
 
@@ -420,6 +420,13 @@ TEST_F(fully_connected_int3_gpu_tests, dg2_simd8_prefill_48) {
         GTEST_SKIP();
     }
     run(base, false, false, {48}, {{"dpas_simd8_t32_sg2"}});
+}
+
+TEST_F(fully_connected_int3_gpu_tests, dg2_scalar_mid_rows) {
+    if (!is_dg2()) {
+        GTEST_SKIP();
+    }
+    run(base, false, false, {32}, {{"scalar_t16"}});
 }
 
 TEST_F(fully_connected_int3_gpu_tests, dg2_simd8_dynamic) {

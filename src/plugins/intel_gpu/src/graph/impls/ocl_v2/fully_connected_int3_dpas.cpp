@@ -436,7 +436,6 @@ enum class GemmVariant : uint8_t {
     scalar_t8,
     scalar_t16,
     dpas_simd8,
-    dpas_simd8_t16,
     dpas_simd8_t32,
     dpas_simd8_t32_sg2,
     dpas_simd8_t32_sg4
@@ -444,7 +443,7 @@ enum class GemmVariant : uint8_t {
 
 // The Xe-HPG (DG2) variants: SIMD8 DPAS, one subgroup per 16-column weight block.
 constexpr bool is_simd8(GemmVariant variant) {
-    return variant == GemmVariant::dpas_simd8 || variant == GemmVariant::dpas_simd8_t16 || variant == GemmVariant::dpas_simd8_t32 ||
+    return variant == GemmVariant::dpas_simd8 || variant == GemmVariant::dpas_simd8_t32 ||
            variant == GemmVariant::dpas_simd8_t32_sg2 || variant == GemmVariant::dpas_simd8_t32_sg4;
 }
 
@@ -622,17 +621,21 @@ GemmVariant get_gemm_variant(const Int3FcInfo& info, gpu_arch arch, size_t rows)
     if (rows < dpas_min_rows) {
         return GemmVariant::scalar;
     }
-    // The SIMD8 variants read the osv16 blocked weights only. SG_M follows the Xe2 v1 thresholds but stops at 4:
-    // on an A770 (256 GRF, so fewer threads per EU), Qwen3-8B prefill of 1024 tokens took 320 ms at SG_M 4 and
-    // 449 ms at SG_M 8.
+    // DG2 thresholds, measured on an A770 (Qwen3-8B int3, first-token latency): the 8-row SIMD8 tile is fastest up
+    // to 16 rows and again from 33 to 40; from 17 to 32 rows too few DPAS row tiles fill the GPU and the scalar path,
+    // which also splits K, wins; SG_M 2 shares the weight decode from 41 rows and SG_M 4 from 96 (SG_M 8 was slower
+    // than no sharing at 1024 rows). The SIMD8 variants read the osv16 blocked weights only.
     if (supports_simd8_dpas(arch) && !use_plain_weights_experiment()) {
-        if (rows <= 8) {
+        if (rows <= 16) {
             return GemmVariant::dpas_simd8;
         }
-        if (rows <= 16) {
-            return GemmVariant::dpas_simd8_t16;
+        if (rows <= 32) {
+            return GemmVariant::scalar_t16;
         }
-        for (size_t sg_m = std::min<size_t>(get_dense_sg_m(rows), 4); sg_m > 1; sg_m /= 2) {
+        if (rows <= 40) {
+            return GemmVariant::dpas_simd8;
+        }
+        for (size_t sg_m = rows >= 96 ? 4 : 2; sg_m > 1; sg_m /= 2) {
             if (is_valid_sg_m(info, sg_m)) {
                 return sg_m == 4 ? GemmVariant::dpas_simd8_t32_sg4 : GemmVariant::dpas_simd8_t32_sg2;
             }
@@ -673,7 +676,7 @@ public:
     // can use, so that they are all compiled with the model, and picks one per execution. Its single-row GEMV is
     // compiled for exactly one row, so a single-row static impl of a dynamic model can reuse it with the quantizer.
     Stage::Ptr quantize = make_stage<Int3FcQuantize>();
-    std::array<Stage::Ptr, 16> gemms = {make_stage<Int3FcGemm>("scalar", GemmConfig{}, GemmVariant::scalar),
+    std::array<Stage::Ptr, 15> gemms = {make_stage<Int3FcGemm>("scalar", GemmConfig{}, GemmVariant::scalar),
                                        make_stage<Int3FcGemm>("v1_t8", get_v1_config(8, 1), GemmVariant::v1_t8),
                                        make_stage<Int3FcGemm>("v1_t16", get_v1_config(16, 1), GemmVariant::v1_t16),
                                        make_stage<Int3FcGemm>("v1_t32_sg1", get_v1_config(32, 1), GemmVariant::v1_t32_sg1),
@@ -685,7 +688,6 @@ public:
                                        make_stage<Int3FcGemm>("scalar_t8", get_scalar_config(8), GemmVariant::scalar_t8),
                                        make_stage<Int3FcGemm>("scalar_t16", get_scalar_config(16), GemmVariant::scalar_t16),
                                        make_stage<Int3FcGemm>("dpas_simd8", get_v1_config(8, 1), GemmVariant::dpas_simd8),
-                                       make_stage<Int3FcGemm>("dpas_simd8_t16", get_v1_config(16, 1), GemmVariant::dpas_simd8_t16),
                                        make_stage<Int3FcGemm>("dpas_simd8_t32", get_v1_config(32, 1), GemmVariant::dpas_simd8_t32),
                                        make_stage<Int3FcGemm>("dpas_simd8_t32_sg2", get_v1_config(32, 2), GemmVariant::dpas_simd8_t32_sg2),
                                        make_stage<Int3FcGemm>("dpas_simd8_t32_sg4", get_v1_config(32, 4), GemmVariant::dpas_simd8_t32_sg4)};
